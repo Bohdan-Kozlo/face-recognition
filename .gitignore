@@ -18,6 +18,11 @@ htmlcov/
 .env.*
 !.env.example
 
+# Local planning context
+context/
+prd.md
+implementation-plan.md
+
 # IDE and operating system
 .idea/
 .vscode/

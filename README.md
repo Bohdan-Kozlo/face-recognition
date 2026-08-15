@@ -75,7 +75,9 @@ uv run streamlit run src/ui.py
 
 ## Documentation
 
-- [Product requirements](./prd.md)
-- [Implementation plan](./implementation-plan.md)
+Local planning documents are kept in the ignored `context/` directory:
+
+- `context/prd.md`
+- `context/implementation-plan.md`
 
 The project is local-only and intended for non-commercial learning and experimentation.
