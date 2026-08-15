@@ -1,0 +1,43 @@
+# Python and uv
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.python_history
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# IDE and operating system
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Datasets, model assets, and checkpoints
+data/
+models/
+checkpoints/
+
+# MLflow and runtime databases
+mlruns/
+mlflow.db
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary uploads and generated artifacts
+uploads/
+tmp/
+temp/
+artifacts/
