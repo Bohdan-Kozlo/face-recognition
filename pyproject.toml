@@ -8,6 +8,9 @@ dependencies = [
     "numpy>=2.3,<3",
     "opencv-python-headless>=4.13,<5",
     "pillow>=12.1,<13",
+    "pytorch-metric-learning>=2.9.0",
+    "torch>=2.11,<2.12",
+    "torchvision>=0.26,<0.27",
 ]
 
 [dependency-groups]
@@ -17,6 +20,15 @@ dev = [
 
 [tool.uv]
 package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [tool.ruff]
 target-version = "py313"
