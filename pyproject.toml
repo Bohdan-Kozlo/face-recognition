@@ -8,7 +8,6 @@ dependencies = [
     "numpy>=2.3,<3",
     "opencv-python-headless>=4.13,<5",
     "pillow>=12.1,<13",
-    "pytorch-metric-learning>=2.9.0",
     "torch>=2.11,<2.12",
     "torchvision>=0.26,<0.27",
 ]
@@ -16,6 +15,17 @@ dependencies = [
 [dependency-groups]
 dev = [
     "ruff>=0.12",
+]
+notebook = [
+    "ipykernel>=7.3.0",
+    "jupyterlab>=4.6.3",
+    "matplotlib>=3.11.1",
+    "pandas>=2.3.3",
+]
+training = [
+    "mlflow>=3.15.1",
+    "pytorch-metric-learning>=2.9.0",
+    "tqdm>=4.70.0",
 ]
 
 [tool.uv]
