@@ -25,7 +25,7 @@ from config import (
     MLFLOW_EXPERIMENT_NAME,
 )
 from data import CelebAFaceDataset
-from model import FaceEmbedder
+from model import BACKBONE_NAME, FaceEmbedder
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_TRACKING_URI = f"sqlite:///{MLFLOW_DATABASE_PATH.resolve().as_posix()}"
@@ -416,6 +416,7 @@ def _log_run_inputs(
     mlflow.log_params(
         {
             **config_values,
+            "backbone": BACKBONE_NAME,
             "momentum": MOMENTUM,
             "weight_decay": WEIGHT_DECAY,
             "number_of_classes": loaders.number_of_classes,

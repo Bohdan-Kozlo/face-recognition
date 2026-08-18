@@ -44,7 +44,7 @@ def evaluate_checkpoint(
     """Evaluate one genuine and one impostor pair per identity."""
 
     device = _resolve_device(config.device)
-    model = FaceEmbedder(config.embedding_dim, pretrained=False).to(device)
+    model = FaceEmbedder(config.embedding_dim).to(device)
     checkpoint = torch.load(config.checkpoint_path, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
