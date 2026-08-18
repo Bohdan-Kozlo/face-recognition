@@ -25,7 +25,7 @@ from config import (
     MLFLOW_EXPERIMENT_NAME,
 )
 from data import CelebAFaceDataset
-from model import BACKBONE_NAME, FaceEmbedder
+from model import BACKBONE_NAME, EMBEDDING_DIM, FaceEmbedder
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_TRACKING_URI = f"sqlite:///{MLFLOW_DATABASE_PATH.resolve().as_posix()}"
@@ -45,11 +45,11 @@ class TrainingConfig:
     validation_manifest: Path = CELEBA_MANIFESTS_DIR / "validation.csv"
     dataset_root: Path = CELEBA_RAW_DIR
     run_name: str | None = None
-    embedding_dim: int = 128
+    embedding_dim: int = EMBEDDING_DIM
     arcface_margin_degrees: float = ARCFACE_MARGIN_DEGREES
     arcface_scale: int = ARCFACE_SCALE
     batch_size: int = 32
-    learning_rate: float = 0.01
+    learning_rate: float = 0.001
     epochs: int = 10
     seed: int = 24
     num_workers: int = 2
@@ -85,7 +85,10 @@ def train(config: TrainingConfig) -> TrainingResult:
     torch.manual_seed(config.seed)
     loaders = _create_data_loaders(config, device)
 
-    model = FaceEmbedder(config.embedding_dim).to(device)
+    model = FaceEmbedder(
+        config.embedding_dim,
+        pretrained=config.resume_from is None,
+    ).to(device)
     loss_function = ArcFaceLoss(
         num_classes=loaders.number_of_classes,
         embedding_size=config.embedding_dim,

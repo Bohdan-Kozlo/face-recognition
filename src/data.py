@@ -17,8 +17,7 @@ from PIL import Image, UnidentifiedImageError
 from torch.utils.data import Dataset
 from torchvision.transforms import v2
 
-from config import CELEBA_MANIFESTS_DIR, CELEBA_RAW_DIR
-from model import IMAGE_SIZE
+from config import CELEBA_MANIFESTS_DIR, CELEBA_RAW_DIR, FACE_IMAGE_SIZE
 
 LOGGER = logging.getLogger(__name__)
 
@@ -85,7 +84,7 @@ def build_face_transform(*, training: bool) -> FaceTransform:
     transforms: list[Callable[..., Any]] = [
         v2.ToImage(),
         v2.CenterCrop((178, 178)),
-        v2.Resize((IMAGE_SIZE, IMAGE_SIZE), antialias=True),
+        v2.Resize((FACE_IMAGE_SIZE, FACE_IMAGE_SIZE), antialias=True),
     ]
     if training:
         transforms.extend(

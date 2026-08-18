@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from config import YUNET_MODEL_PATH
+from config import FACE_IMAGE_SIZE, YUNET_MODEL_PATH
 
 SUPPORTED_IMAGE_FORMATS = {"JPEG", "PNG"}
 ARCFACE_112_TEMPLATE = np.array(
@@ -47,7 +47,7 @@ class VisionError(ValueError):
 class VisionConfig:
     max_file_size_bytes: int = 10 * 1024 * 1024
     max_input_side: int = 1280
-    output_size: int = 112
+    output_size: int = FACE_IMAGE_SIZE
     score_threshold: float = 0.9
     nms_threshold: float = 0.3
     top_k: int = 5000

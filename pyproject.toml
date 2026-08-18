@@ -5,6 +5,7 @@ description = "Educational face verification authentication prototype"
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
 dependencies = [
+    "facenet-pytorch==2.6.0",
     "numpy>=2.3,<3",
     "opencv-python-headless>=4.13,<5",
     "pillow>=12.1,<13",
@@ -30,6 +31,12 @@ training = [
 
 [tool.uv]
 package = false
+override-dependencies = [
+    "numpy>=2.3,<3",
+    "pillow>=12.1,<13",
+    "torch>=2.11,<2.12",
+    "torchvision>=0.26,<0.27",
+]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
