@@ -11,7 +11,7 @@ import mlflow
 import torch
 from pytorch_metric_learning.losses import ArcFaceLoss
 from torch import nn
-from torch.amp.grad_scaler import GradScaler
+from torch.cuda.amp import GradScaler
 from torch.optim import SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
@@ -106,7 +106,7 @@ def train(config: TrainingConfig) -> TrainingResult:
         weight_decay=WEIGHT_DECAY,
     )
     scheduler = CosineAnnealingLR(optimizer, T_max=config.epochs)
-    scaler = GradScaler("cuda", init_scale=128, enabled=device.type == "cuda")
+    scaler = GradScaler(init_scale=128, enabled=device.type == "cuda")
 
     start_epoch = 0
     if config.resume_from is not None:
