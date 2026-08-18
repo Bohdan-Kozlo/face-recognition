@@ -11,6 +11,7 @@ import mlflow
 import torch
 from pytorch_metric_learning.losses import ArcFaceLoss
 from torch import nn
+from torch.amp.grad_scaler import GradScaler
 from torch.optim import SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
@@ -105,7 +106,7 @@ def train(config: TrainingConfig) -> TrainingResult:
         weight_decay=WEIGHT_DECAY,
     )
     scheduler = CosineAnnealingLR(optimizer, T_max=config.epochs)
-    scaler = torch.GradScaler("cuda", init_scale=128, enabled=device.type == "cuda")
+    scaler = GradScaler("cuda", init_scale=128, enabled=device.type == "cuda")
 
     start_epoch = 0
     if config.resume_from is not None:
@@ -243,7 +244,7 @@ def _train_epoch(
     loss_function: nn.Module,
     loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
     optimizer: SGD,
-    scaler: torch.GradScaler,
+    scaler: GradScaler,
     device: torch.device,
     batch_limit: int | None,
     epoch: int,
@@ -358,7 +359,7 @@ def _save_checkpoint(
     loss_function: nn.Module,
     optimizer: SGD,
     scheduler: CosineAnnealingLR,
-    scaler: torch.GradScaler,
+    scaler: GradScaler,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -381,7 +382,7 @@ def _restore_checkpoint(
     loss_function: nn.Module,
     optimizer: SGD,
     scheduler: CosineAnnealingLR,
-    scaler: torch.GradScaler,
+    scaler: GradScaler,
 ) -> int:
     if not path.is_file():
         raise TrainingError(f"Resume checkpoint does not exist: {path}")
