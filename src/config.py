@@ -1,11 +1,14 @@
+import os
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-FACE_IMAGE_SIZE = 160
+FACE_IMAGE_SIZE = 112
 
 DATA_DIR = PROJECT_ROOT / "data"
 MODELS_DIR = PROJECT_ROOT / "models"
-CHECKPOINTS_DIR = PROJECT_ROOT / "checkpoints"
+CHECKPOINTS_DIR = Path(
+    os.environ.get("FACE_RECOGNITION_CHECKPOINTS_DIR", PROJECT_ROOT / "checkpoints")
+)
 
 CELEBA_ROOT = DATA_DIR / "celeba"
 CELEBA_RAW_DIR = CELEBA_ROOT / "raw"

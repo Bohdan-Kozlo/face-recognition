@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
-import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -26,9 +24,8 @@ from config import (
     MLFLOW_EXPERIMENT_NAME,
 )
 from data import CelebAFaceDataset
-from model import BACKBONE_NAME, EMBEDDING_DIM, FaceEmbedder
+from model import BACKBONE_NAME, EMBEDDING_DIM, FaceEmbedder, FineTuningStage
 
-LOGGER = logging.getLogger(__name__)
 DEFAULT_TRACKING_URI = f"sqlite:///{MLFLOW_DATABASE_PATH.resolve().as_posix()}"
 ARCFACE_MARGIN_DEGREES = 28.6
 ARCFACE_SCALE = 64
@@ -46,12 +43,12 @@ class TrainingConfig:
     validation_manifest: Path = CELEBA_MANIFESTS_DIR / "validation.csv"
     dataset_root: Path = CELEBA_RAW_DIR
     run_name: str | None = None
-    embedding_dim: int = EMBEDDING_DIM
-    arcface_margin_degrees: float = ARCFACE_MARGIN_DEGREES
-    arcface_scale: int = ARCFACE_SCALE
     batch_size: int = 32
-    learning_rate: float = 0.001
-    epochs: int = 10
+    backbone_learning_rate: float = 1e-5
+    arcface_learning_rate: float = 1e-3
+    epochs: int = 12
+    head_only_epochs: int = 2
+    full_unfreeze_epoch: int = 6
     seed: int = 24
     num_workers: int = 2
     identity_limit: int | None = None
@@ -86,22 +83,19 @@ def train(config: TrainingConfig) -> TrainingResult:
     torch.manual_seed(config.seed)
     loaders = _create_data_loaders(config, device)
 
-    model = FaceEmbedder(
-        config.embedding_dim,
-        pretrained=config.resume_from is None,
-    ).to(device)
+    model = FaceEmbedder().to(device)
     loss_function = ArcFaceLoss(
         num_classes=loaders.number_of_classes,
-        embedding_size=config.embedding_dim,
-        margin=config.arcface_margin_degrees,
-        scale=config.arcface_scale,
+        embedding_size=EMBEDDING_DIM,
+        margin=ARCFACE_MARGIN_DEGREES,
+        scale=ARCFACE_SCALE,
     ).to(device)
     optimizer = SGD(
         [
-            {"params": model.parameters()},
-            {"params": loss_function.parameters()},
+            {"params": model.parameters(), "lr": config.backbone_learning_rate},
+            {"params": loss_function.parameters(), "lr": config.arcface_learning_rate},
         ],
-        lr=config.learning_rate,
+        lr=config.arcface_learning_rate,
         momentum=MOMENTUM,
         weight_decay=WEIGHT_DECAY,
     )
@@ -135,6 +129,8 @@ def train(config: TrainingConfig) -> TrainingResult:
                 epoch_seed = config.seed + epoch
                 torch.manual_seed(epoch_seed)
                 loaders.train_generator.manual_seed(epoch_seed)
+                fine_tuning_stage = _fine_tuning_stage(epoch, config)
+                model.set_fine_tuning_stage(fine_tuning_stage)
 
                 train_loss = _train_epoch(
                     model,
@@ -146,6 +142,7 @@ def train(config: TrainingConfig) -> TrainingResult:
                     config.batch_limit,
                     epoch,
                     config.epochs,
+                    fine_tuning_stage,
                 )
                 validation_metrics = _evaluate_embeddings(
                     model,
@@ -155,13 +152,17 @@ def train(config: TrainingConfig) -> TrainingResult:
                 )
 
                 completed_epochs = epoch + 1
-                learning_rate = optimizer.param_groups[0]["lr"]
+                backbone_learning_rate = optimizer.param_groups[0]["lr"]
+                arcface_learning_rate = optimizer.param_groups[1]["lr"]
                 scheduler.step()
                 mlflow.log_metrics(
                     {
                         "train/loss": train_loss,
-                        "train/learning_rate": learning_rate,
-                        "system/amp_enabled": float(device.type == "cuda"),
+                        "train/backbone_learning_rate": backbone_learning_rate,
+                        "train/arcface_learning_rate": arcface_learning_rate,
+                        "train/fine_tuning_stage": float(
+                            {"frozen": 0, "last_stage": 1, "all": 2}[fine_tuning_stage]
+                        ),
                         **validation_metrics,
                     },
                     step=completed_epochs,
@@ -174,13 +175,6 @@ def train(config: TrainingConfig) -> TrainingResult:
                     optimizer,
                     scheduler,
                     scaler,
-                )
-                LOGGER.info(
-                    "Epoch %d/%d: loss=%.4f, validation_gap=%.4f",
-                    completed_epochs,
-                    config.epochs,
-                    train_loss,
-                    validation_metrics["validation/similarity_gap"],
                 )
         except KeyboardInterrupt:
             _save_checkpoint(
@@ -249,6 +243,7 @@ def _train_epoch(
     batch_limit: int | None,
     epoch: int,
     epochs: int,
+    fine_tuning_stage: FineTuningStage,
 ) -> float:
     model.train()
     loss_function.train()
@@ -256,7 +251,7 @@ def _train_epoch(
     processed_batches = 0
     progress = tqdm(
         loader,
-        desc=f"Train {epoch + 1}/{epochs}",
+        desc=f"Train {epoch + 1}/{epochs} [{fine_tuning_stage}]",
         total=_limited_length(len(loader), batch_limit),
     )
 
@@ -421,6 +416,9 @@ def _log_run_inputs(
         {
             **config_values,
             "backbone": BACKBONE_NAME,
+            "embedding_dim": EMBEDDING_DIM,
+            "arcface_margin_degrees": ARCFACE_MARGIN_DEGREES,
+            "arcface_scale": ARCFACE_SCALE,
             "momentum": MOMENTUM,
             "weight_decay": WEIGHT_DECAY,
             "number_of_classes": loaders.number_of_classes,
@@ -436,12 +434,10 @@ def _log_run_inputs(
 
 def _validate_config(config: TrainingConfig) -> None:
     positive_values = {
-        "embedding_dim": config.embedding_dim,
         "batch_size": config.batch_size,
-        "learning_rate": config.learning_rate,
+        "backbone_learning_rate": config.backbone_learning_rate,
+        "arcface_learning_rate": config.arcface_learning_rate,
         "epochs": config.epochs,
-        "arcface_margin_degrees": config.arcface_margin_degrees,
-        "arcface_scale": config.arcface_scale,
     }
     invalid = [name for name, value in positive_values.items() if value <= 0]
     if invalid:
@@ -452,6 +448,10 @@ def _validate_config(config: TrainingConfig) -> None:
         raise TrainingError("batch_limit must be positive")
     if config.validation_batch_limit is not None and config.validation_batch_limit <= 0:
         raise TrainingError("validation_batch_limit must be positive")
+    if not 0 <= config.head_only_epochs < config.full_unfreeze_epoch < config.epochs:
+        raise TrainingError(
+            "Fine-tuning schedule must satisfy 0 <= head_only_epochs < full_unfreeze_epoch < epochs"
+        )
 
 
 def _resolve_device(requested: str) -> torch.device:
@@ -468,57 +468,9 @@ def _limited_length(total: int, limit: int | None) -> int:
     return min(total, limit) if limit is not None else total
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    defaults = TrainingConfig()
-    parser = argparse.ArgumentParser(description="Train the CelebA ArcFace embedder")
-    parser.add_argument("--train-manifest", type=Path, default=defaults.train_manifest)
-    parser.add_argument(
-        "--validation-manifest",
-        type=Path,
-        default=defaults.validation_manifest,
-    )
-    parser.add_argument("--dataset-root", type=Path, default=defaults.dataset_root)
-    parser.add_argument("--run-name")
-    parser.add_argument("--embedding-dim", type=int, default=defaults.embedding_dim)
-    parser.add_argument(
-        "--arcface-margin-degrees",
-        type=float,
-        default=defaults.arcface_margin_degrees,
-    )
-    parser.add_argument("--arcface-scale", type=int, default=defaults.arcface_scale)
-    parser.add_argument("--batch-size", type=int, default=defaults.batch_size)
-    parser.add_argument("--learning-rate", type=float, default=defaults.learning_rate)
-    parser.add_argument("--epochs", type=int, default=defaults.epochs)
-    parser.add_argument("--seed", type=int, default=defaults.seed)
-    parser.add_argument("--num-workers", type=int, default=defaults.num_workers)
-    parser.add_argument("--identity-limit", type=int)
-    parser.add_argument("--batch-limit", type=int)
-    parser.add_argument(
-        "--validation-batch-limit",
-        type=int,
-        default=defaults.validation_batch_limit,
-    )
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default=defaults.device)
-    parser.add_argument("--resume-from", type=Path)
-    return parser
-
-
-def main() -> int:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    config = TrainingConfig(**vars(_build_parser().parse_args()))
-    try:
-        result = train(config)
-    except KeyboardInterrupt:
-        LOGGER.warning("Training interrupted; the latest checkpoint is in checkpoints/last.pt")
-        return 130
-    except (TrainingError, OSError, ValueError, RuntimeError) as error:
-        LOGGER.error("%s", error)
-        return 1
-
-    print(f"MLflow run: {result.run_id}")
-    print(f"Checkpoint: {result.checkpoint_path}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+def _fine_tuning_stage(epoch: int, config: TrainingConfig) -> FineTuningStage:
+    if epoch < config.head_only_epochs:
+        return "frozen"
+    if epoch < config.full_unfreeze_epoch:
+        return "last_stage"
+    return "all"
