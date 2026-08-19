@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import mlflow
+import numpy as np
 import torch
 from pytorch_metric_learning.losses import ArcFaceLoss
 from torch import nn
-from torch.cuda.amp import GradScaler
 from torch.optim import SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
@@ -25,7 +26,14 @@ from config import (
     MLFLOW_EXPERIMENT_NAME,
 )
 from data import CelebAFaceDataset
-from model import BACKBONE_NAME, EMBEDDING_DIM, FaceEmbedder, FineTuningStage
+from model import (
+    BACKBONE_NAME,
+    EMBEDDING_DIM,
+    FaceEmbedder,
+    FineTuningMode,
+    checkpoint_metadata,
+    validate_checkpoint_metadata,
+)
 
 DEFAULT_TRACKING_URI = f"sqlite:///{MLFLOW_DATABASE_PATH.resolve().as_posix()}"
 ARCFACE_MARGIN_DEGREES = 28.6
@@ -46,11 +54,12 @@ class TrainingConfig:
     run_name: str | None = None
     batch_size: int = 32
     backbone_learning_rate: float = 1e-5
+    embedding_learning_rate: float = 1e-3
     arcface_learning_rate: float = 1e-3
     epochs: int = 12
-    head_only_epochs: int = 2
-    full_unfreeze_epoch: int = 6
+    fine_tuning: FineTuningMode = "last-layer"
     seed: int = 24
+    deterministic: bool = False
     num_workers: int = 2
     identity_limit: int | None = None
     batch_limit: int | None = None
@@ -79,10 +88,11 @@ class _DataLoaders:
 def train(config: TrainingConfig) -> TrainingResult:
     _validate_config(config)
     device = _resolve_device(config.device)
-    torch.manual_seed(config.seed)
+    _seed_everything(config.seed, deterministic=config.deterministic)
     loaders = _create_data_loaders(config, device)
 
     model = FaceEmbedder().to(device)
+    model.set_fine_tuning_mode(config.fine_tuning)
     loss_function = ArcFaceLoss(
         num_classes=loaders.number_of_classes,
         embedding_size=EMBEDDING_DIM,
@@ -90,16 +100,18 @@ def train(config: TrainingConfig) -> TrainingResult:
         scale=ARCFACE_SCALE,
     ).to(device)
     optimizer = SGD(
-        [
-            {"params": model.parameters(), "lr": config.backbone_learning_rate},
+        model.optimizer_parameter_groups(
+            backbone_learning_rate=config.backbone_learning_rate,
+            embedding_learning_rate=config.embedding_learning_rate,
+        )
+        + [
             {"params": loss_function.parameters(), "lr": config.arcface_learning_rate},
         ],
-        lr=config.arcface_learning_rate,
         momentum=MOMENTUM,
         weight_decay=WEIGHT_DECAY,
     )
     scheduler = CosineAnnealingLR(optimizer, T_max=config.epochs)
-    scaler = GradScaler(init_scale=128, enabled=device.type == "cuda")
+    scaler = torch.amp.GradScaler(device.type, init_scale=128, enabled=device.type == "cuda")
 
     start_epoch = 0
     if config.resume_from is not None:
@@ -118,18 +130,14 @@ def train(config: TrainingConfig) -> TrainingResult:
         )
 
     experiment_id = _configure_mlflow()
-    checkpoint_path = CHECKPOINTS_DIR / "last.pt"
+    checkpoint_path = CHECKPOINTS_DIR / f"resnet50-{config.fine_tuning}.pt"
     completed_epochs = start_epoch
 
     with mlflow.start_run(experiment_id=experiment_id, run_name=config.run_name) as active_run:
         _log_run_inputs(config, loaders, device)
         try:
             for epoch in range(start_epoch, config.epochs):
-                epoch_seed = config.seed + epoch
-                torch.manual_seed(epoch_seed)
-                loaders.train_generator.manual_seed(epoch_seed)
-                fine_tuning_stage = _fine_tuning_stage(epoch, config)
-                model.set_fine_tuning_stage(fine_tuning_stage)
+                loaders.train_generator.manual_seed(config.seed + epoch)
 
                 train_loss = _train_epoch(
                     model,
@@ -141,7 +149,7 @@ def train(config: TrainingConfig) -> TrainingResult:
                     config.batch_limit,
                     epoch,
                     config.epochs,
-                    fine_tuning_stage,
+                    config.fine_tuning,
                 )
                 validation_metrics = _evaluate_embeddings(
                     model,
@@ -151,17 +159,15 @@ def train(config: TrainingConfig) -> TrainingResult:
                 )
 
                 completed_epochs = epoch + 1
-                backbone_learning_rate = optimizer.param_groups[0]["lr"]
-                arcface_learning_rate = optimizer.param_groups[1]["lr"]
+                learning_rates = {
+                    f"train/{group['name']}_learning_rate": float(group["lr"])
+                    for group in optimizer.param_groups
+                }
                 scheduler.step()
                 mlflow.log_metrics(
                     {
                         "train/loss": train_loss,
-                        "train/backbone_learning_rate": backbone_learning_rate,
-                        "train/arcface_learning_rate": arcface_learning_rate,
-                        "train/fine_tuning_stage": float(
-                            {"frozen": 0, "last_stage": 1, "all": 2}[fine_tuning_stage]
-                        ),
+                        **learning_rates,
                         **validation_metrics,
                     },
                     step=completed_epochs,
@@ -174,6 +180,7 @@ def train(config: TrainingConfig) -> TrainingResult:
                     optimizer,
                     scheduler,
                     scaler,
+                    config.fine_tuning,
                 )
         except KeyboardInterrupt:
             _save_checkpoint(
@@ -184,6 +191,7 @@ def train(config: TrainingConfig) -> TrainingResult:
                 optimizer,
                 scheduler,
                 scaler,
+                config.fine_tuning,
             )
             mlflow.log_artifact(str(checkpoint_path), artifact_path="checkpoints")
             raise
@@ -215,6 +223,7 @@ def _create_data_loaders(config: TrainingConfig, device: torch.device) -> _DataL
         "batch_size": config.batch_size,
         "num_workers": config.num_workers,
         "pin_memory": device.type == "cuda",
+        "worker_init_fn": _seed_worker,
     }
     return _DataLoaders(
         train=DataLoader(
@@ -237,12 +246,12 @@ def _train_epoch(
     loss_function: nn.Module,
     loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
     optimizer: SGD,
-    scaler: GradScaler,
+    scaler: torch.amp.GradScaler,
     device: torch.device,
     batch_limit: int | None,
     epoch: int,
     epochs: int,
-    fine_tuning_stage: FineTuningStage,
+    fine_tuning: FineTuningMode,
 ) -> float:
     model.train()
     loss_function.train()
@@ -250,7 +259,7 @@ def _train_epoch(
     processed_batches = 0
     progress = tqdm(
         loader,
-        desc=f"Train {epoch + 1}/{epochs} [{fine_tuning_stage}]",
+        desc=f"Train {epoch + 1}/{epochs} [{fine_tuning}]",
         total=_limited_length(len(loader), batch_limit),
     )
 
@@ -353,7 +362,8 @@ def _save_checkpoint(
     loss_function: nn.Module,
     optimizer: SGD,
     scheduler: CosineAnnealingLR,
-    scaler: GradScaler,
+    scaler: torch.amp.GradScaler,
+    fine_tuning: FineTuningMode,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -364,6 +374,7 @@ def _save_checkpoint(
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "grad_scaler_state_dict": scaler.state_dict(),
+            "metadata": checkpoint_metadata(fine_tuning=fine_tuning),
         },
         path,
     )
@@ -376,12 +387,22 @@ def _restore_checkpoint(
     loss_function: nn.Module,
     optimizer: SGD,
     scheduler: CosineAnnealingLR,
-    scaler: GradScaler,
+    scaler: torch.amp.GradScaler,
+    fine_tuning: FineTuningMode,
 ) -> int:
     if not path.is_file():
         raise TrainingError(f"Resume checkpoint does not exist: {path}")
 
     checkpoint = torch.load(path, map_location=device, weights_only=True)
+    try:
+        saved_fine_tuning = validate_checkpoint_metadata(checkpoint)
+    except ValueError as error:
+        raise TrainingError(f"Cannot resume checkpoint: {error}") from error
+    if saved_fine_tuning != fine_tuning:
+        raise TrainingError(
+            "Checkpoint fine-tuning mode does not match the current run: "
+            f"{saved_fine_tuning!r} != {fine_tuning!r}"
+        )
     model.load_state_dict(checkpoint["model_state_dict"])
     loss_function.load_state_dict(checkpoint["arcface_loss_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -416,6 +437,7 @@ def _log_run_inputs(
             **config_values,
             "backbone": BACKBONE_NAME,
             "embedding_dim": EMBEDDING_DIM,
+            "fine_tuning": config.fine_tuning,
             "arcface_margin_degrees": ARCFACE_MARGIN_DEGREES,
             "arcface_scale": ARCFACE_SCALE,
             "momentum": MOMENTUM,
@@ -435,6 +457,7 @@ def _validate_config(config: TrainingConfig) -> None:
     positive_values = {
         "batch_size": config.batch_size,
         "backbone_learning_rate": config.backbone_learning_rate,
+        "embedding_learning_rate": config.embedding_learning_rate,
         "arcface_learning_rate": config.arcface_learning_rate,
         "epochs": config.epochs,
     }
@@ -447,10 +470,8 @@ def _validate_config(config: TrainingConfig) -> None:
         raise TrainingError("batch_limit must be positive")
     if config.validation_batch_limit is not None and config.validation_batch_limit <= 0:
         raise TrainingError("validation_batch_limit must be positive")
-    if not 0 <= config.head_only_epochs < config.full_unfreeze_epoch < config.epochs:
-        raise TrainingError(
-            "Fine-tuning schedule must satisfy 0 <= head_only_epochs < full_unfreeze_epoch < epochs"
-        )
+    if config.fine_tuning not in {"last-layer", "all"}:
+        raise TrainingError("fine_tuning must be last-layer or all")
 
 
 def _resolve_device(requested: str) -> torch.device:
@@ -467,25 +488,40 @@ def _limited_length(total: int, limit: int | None) -> int:
     return min(total, limit) if limit is not None else total
 
 
-def _fine_tuning_stage(epoch: int, config: TrainingConfig) -> FineTuningStage:
-    if epoch < config.head_only_epochs:
-        return "frozen"
-    if epoch < config.full_unfreeze_epoch:
-        return "last_stage"
-    return "all"
+def _seed_everything(seed: int, *, deterministic: bool) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(deterministic)
+    torch.backends.cudnn.benchmark = not deterministic
+    torch.backends.cudnn.deterministic = deterministic
+
+
+def _seed_worker(worker_id: int) -> None:
+    del worker_id
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Fine-tune pretrained EdgeFace-S on CelebA.",
+        description="Fine-tune pretrained ResNet50 on CelebA.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
-    parser.add_argument("--run-name", default="edgeface-local")
+    parser.add_argument("--fine-tuning", choices=("last-layer", "all"), required=True)
+    parser.add_argument("--run-name", default="resnet50-local")
     parser.add_argument("--resume-from", type=Path)
+    parser.add_argument("--identity-limit", type=int)
+    parser.add_argument("--batch-limit", type=int)
+    parser.add_argument("--validation-batch-limit", type=int)
+    parser.add_argument("--deterministic", action="store_true")
     args = parser.parse_args()
 
     result = train(
@@ -496,6 +532,11 @@ def main() -> None:
             num_workers=args.num_workers,
             device=args.device,
             resume_from=args.resume_from,
+            fine_tuning=args.fine_tuning,
+            identity_limit=args.identity_limit,
+            batch_limit=args.batch_limit,
+            validation_batch_limit=args.validation_batch_limit,
+            deterministic=args.deterministic,
         )
     )
     print(f"Completed epochs: {result.completed_epochs}")

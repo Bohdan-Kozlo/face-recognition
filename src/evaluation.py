@@ -10,15 +10,15 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from config import CELEBA_RAW_DIR, CHECKPOINTS_DIR
+from config import CELEBA_RAW_DIR
 from data import CelebAFaceDataset
-from model import FaceEmbedder
+from model import FaceEmbedder, validate_checkpoint_metadata
 
 
 @dataclass(frozen=True, slots=True)
 class EvaluationConfig:
     manifest_path: Path
-    checkpoint_path: Path = CHECKPOINTS_DIR / "last.pt"
+    checkpoint_path: Path
     dataset_root: Path = CELEBA_RAW_DIR
     batch_size: int = 32
     num_workers: int = 2
@@ -43,8 +43,12 @@ def evaluate_checkpoint(
     """Evaluate one genuine and one impostor pair per identity."""
 
     device = _resolve_device(config.device)
-    model = FaceEmbedder().to(device)
     checkpoint = torch.load(config.checkpoint_path, map_location=device, weights_only=True)
+    try:
+        validate_checkpoint_metadata(checkpoint)
+    except ValueError as error:
+        raise ValueError(f"Cannot evaluate checkpoint: {error}") from error
+    model = FaceEmbedder(weights=None).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 

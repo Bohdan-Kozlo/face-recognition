@@ -1,54 +1,110 @@
 from __future__ import annotations
 
-from typing import Literal
+from collections.abc import Mapping
+from typing import Any, Literal
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torchvision.models import ResNet50_Weights, resnet50
+
+from config import FACE_IMAGE_SIZE, IMAGENET_MEAN, IMAGENET_STD
 
 EMBEDDING_DIM = 512
-BACKBONE_NAME = "edgeface_s_gamma_05"
-EDGEFACE_REVISION = "ce86851cfc37979a9cd2558598d0e9bc592cbba3"
-EDGEFACE_REPOSITORY = f"otroshi/edgeface:{EDGEFACE_REVISION}"
-EDGEFACE_WEIGHTS_URL = (
-    "https://raw.githubusercontent.com/otroshi/edgeface/"
-    f"{EDGEFACE_REVISION}/checkpoints/edgeface_s_gamma_05.pt"
-)
+BACKBONE_NAME = "resnet50_imagenet1k_v2"
+CHECKPOINT_FORMAT_VERSION = 1
 
-FineTuningStage = Literal["frozen", "last_stage", "all"]
+FineTuningMode = Literal["last-layer", "all"]
 
 
 class FaceEmbedder(nn.Module):
-    def __init__(self) -> None:
+    def __init__(
+        self, *, weights: ResNet50_Weights | None = ResNet50_Weights.IMAGENET1K_V2
+    ) -> None:
         super().__init__()
-        backbone = torch.hub.load(
-            EDGEFACE_REPOSITORY,
-            BACKBONE_NAME,
-            source="github",
-            pretrained=False,
-            trust_repo=True,  # pyright: ignore[reportArgumentType]
-            skip_validation=True,
-        )
-        if not isinstance(backbone, nn.Module):
-            raise TypeError("EdgeFace repository did not return a PyTorch module")
-        state_dict = torch.hub.load_state_dict_from_url(
-            EDGEFACE_WEIGHTS_URL,
-            map_location="cpu",
-            file_name=f"{BACKBONE_NAME}_{EDGEFACE_REVISION[:8]}.pt",
-            weights_only=True,
-        )
-        backbone.load_state_dict(state_dict)
+        backbone = resnet50(weights=weights)
+        input_features = backbone.fc.in_features
+        backbone.fc = nn.Linear(input_features, EMBEDDING_DIM, bias=False)
         self.backbone = backbone
+        self._fine_tuning_mode: FineTuningMode = "last-layer"
+        self.set_fine_tuning_mode(self._fine_tuning_mode)
 
-    def set_fine_tuning_stage(self, stage: FineTuningStage) -> None:
+    def set_fine_tuning_mode(self, mode: FineTuningMode) -> None:
         for parameter in self.backbone.parameters():
-            parameter.requires_grad = stage == "all"
+            parameter.requires_grad = mode == "all"
+        for parameter in self.backbone.fc.parameters():
+            parameter.requires_grad = True
+        self._fine_tuning_mode = mode
 
-        if stage == "last_stage":
-            for module_name in ("model.stages.3", "model.head"):
-                for parameter in self.backbone.get_submodule(module_name).parameters():
-                    parameter.requires_grad = True
+    def optimizer_parameter_groups(
+        self,
+        *,
+        backbone_learning_rate: float,
+        embedding_learning_rate: float,
+    ) -> list[dict[str, object]]:
+        groups: list[dict[str, object]] = [
+            {
+                "name": "embedding",
+                "params": self.backbone.fc.parameters(),
+                "lr": embedding_learning_rate,
+            }
+        ]
+        if self._fine_tuning_mode == "all":
+            groups.insert(
+                0,
+                {
+                    "name": "backbone",
+                    "params": (
+                        parameter
+                        for name, parameter in self.backbone.named_parameters()
+                        if name != "fc.weight"
+                    ),
+                    "lr": backbone_learning_rate,
+                },
+            )
+        return groups
+
+    def train(self, mode: bool = True) -> FaceEmbedder:
+        super().train(mode)
+        if mode and self._fine_tuning_mode == "last-layer":
+            for module in self.backbone.modules():
+                if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                    module.eval()
+        return self
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        embeddings = self.backbone(images * 2.0 - 1.0)
+        embeddings = self.backbone(images)
         return F.normalize(embeddings, dim=1)
+
+
+def checkpoint_metadata(*, fine_tuning: FineTuningMode) -> dict[str, str | int]:
+    return {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "backbone": BACKBONE_NAME,
+        "embedding_dim": EMBEDDING_DIM,
+        "face_image_size": FACE_IMAGE_SIZE,
+        "normalization": f"imagenet:{IMAGENET_MEAN}:{IMAGENET_STD}",
+        "fine_tuning": fine_tuning,
+    }
+
+
+def validate_checkpoint_metadata(checkpoint: Mapping[str, Any]) -> FineTuningMode:
+    metadata = checkpoint.get("metadata")
+    if not isinstance(metadata, Mapping):
+        raise ValueError("Checkpoint has no ResNet50 metadata and cannot be loaded")
+
+    expected = checkpoint_metadata(fine_tuning="last-layer")
+    for field in (
+        "format_version",
+        "backbone",
+        "embedding_dim",
+        "face_image_size",
+        "normalization",
+    ):
+        if metadata.get(field) != expected[field]:
+            raise ValueError(f"Checkpoint is incompatible: expected {field}={expected[field]!r}")
+
+    fine_tuning = metadata.get("fine_tuning")
+    if fine_tuning not in {"last-layer", "all"}:
+        raise ValueError("Checkpoint has an unknown fine-tuning mode")
+    return fine_tuning
