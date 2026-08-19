@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -76,8 +77,6 @@ class _DataLoaders:
 
 
 def train(config: TrainingConfig) -> TrainingResult:
-    """Train the face embedder and return the recorded run."""
-
     _validate_config(config)
     device = _resolve_device(config.device)
     torch.manual_seed(config.seed)
@@ -474,3 +473,35 @@ def _fine_tuning_stage(epoch: int, config: TrainingConfig) -> FineTuningStage:
     if epoch < config.full_unfreeze_epoch:
         return "last_stage"
     return "all"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Fine-tune pretrained EdgeFace-S on CelebA.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--epochs", type=int, default=12)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
+    parser.add_argument("--run-name", default="edgeface-local")
+    parser.add_argument("--resume-from", type=Path)
+    args = parser.parse_args()
+
+    result = train(
+        TrainingConfig(
+            run_name=args.run_name,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            device=args.device,
+            resume_from=args.resume_from,
+        )
+    )
+    print(f"Completed epochs: {result.completed_epochs}")
+    print(f"Checkpoint: {result.checkpoint_path}")
+    print(f"MLflow run: {result.run_id}")
+
+
+if __name__ == "__main__":
+    main()

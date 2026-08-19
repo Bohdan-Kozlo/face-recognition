@@ -170,7 +170,6 @@ def _select_and_remap_records(
         for identity_id in identity_ids
     }
 
-    # Interleaving keeps limited validation batches representative of multiple identities.
     interleaved: list[ManifestRecord] = []
     largest_identity = max(len(items) for items in remapped_by_identity.values())
     for image_index in range(largest_identity):
