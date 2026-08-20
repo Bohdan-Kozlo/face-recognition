@@ -6,13 +6,14 @@ import argparse
 import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 import mlflow
 import numpy as np
 import torch
 from pytorch_metric_learning.losses import ArcFaceLoss
 from torch import nn
-from torch.optim import SGD
+from torch.optim import SGD, Optimizer
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -40,6 +41,8 @@ ARCFACE_MARGIN_DEGREES = 28.6
 ARCFACE_SCALE = 64
 MOMENTUM = 0.9
 WEIGHT_DECAY = 5e-4
+
+type GradScaler = Any
 
 
 class TrainingError(RuntimeError):
@@ -85,6 +88,40 @@ class _DataLoaders:
     validation_images: int
 
 
+def _create_optimizer(
+    model: FaceEmbedder,
+    loss_function: nn.Module,
+    config: TrainingConfig,
+) -> SGD:
+    return SGD(
+        model.optimizer_parameter_groups(
+            backbone_learning_rate=config.backbone_learning_rate,
+            embedding_learning_rate=config.embedding_learning_rate,
+        )
+        + [
+            {
+                "name": "arcface",
+                "params": loss_function.parameters(),
+                "lr": config.arcface_learning_rate,
+            },
+        ],
+        momentum=MOMENTUM,
+        weight_decay=WEIGHT_DECAY,
+    )
+
+
+def _learning_rate_metrics(optimizer: Optimizer) -> dict[str, float]:
+    return {
+        f"train/{group['name']}_learning_rate": float(group["lr"])
+        for group in optimizer.param_groups
+    }
+
+
+def _create_grad_scaler(device: torch.device) -> GradScaler:
+    torch_amp: Any = torch.amp
+    return torch_amp.GradScaler(device.type, init_scale=128, enabled=device.type == "cuda")
+
+
 def train(config: TrainingConfig) -> TrainingResult:
     _validate_config(config)
     device = _resolve_device(config.device)
@@ -99,19 +136,9 @@ def train(config: TrainingConfig) -> TrainingResult:
         margin=ARCFACE_MARGIN_DEGREES,
         scale=ARCFACE_SCALE,
     ).to(device)
-    optimizer = SGD(
-        model.optimizer_parameter_groups(
-            backbone_learning_rate=config.backbone_learning_rate,
-            embedding_learning_rate=config.embedding_learning_rate,
-        )
-        + [
-            {"params": loss_function.parameters(), "lr": config.arcface_learning_rate},
-        ],
-        momentum=MOMENTUM,
-        weight_decay=WEIGHT_DECAY,
-    )
+    optimizer = _create_optimizer(model, loss_function, config)
     scheduler = CosineAnnealingLR(optimizer, T_max=config.epochs)
-    scaler = torch.amp.GradScaler(device.type, init_scale=128, enabled=device.type == "cuda")
+    scaler = _create_grad_scaler(device)
 
     start_epoch = 0
     if config.resume_from is not None:
@@ -123,6 +150,7 @@ def train(config: TrainingConfig) -> TrainingResult:
             optimizer,
             scheduler,
             scaler,
+            config.fine_tuning,
         )
     if start_epoch >= config.epochs:
         raise TrainingError(
@@ -159,10 +187,7 @@ def train(config: TrainingConfig) -> TrainingResult:
                 )
 
                 completed_epochs = epoch + 1
-                learning_rates = {
-                    f"train/{group['name']}_learning_rate": float(group["lr"])
-                    for group in optimizer.param_groups
-                }
+                learning_rates = _learning_rate_metrics(optimizer)
                 scheduler.step()
                 mlflow.log_metrics(
                     {
@@ -246,7 +271,7 @@ def _train_epoch(
     loss_function: nn.Module,
     loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
     optimizer: SGD,
-    scaler: torch.amp.GradScaler,
+    scaler: GradScaler,
     device: torch.device,
     batch_limit: int | None,
     epoch: int,
@@ -362,7 +387,7 @@ def _save_checkpoint(
     loss_function: nn.Module,
     optimizer: SGD,
     scheduler: CosineAnnealingLR,
-    scaler: torch.amp.GradScaler,
+    scaler: GradScaler,
     fine_tuning: FineTuningMode,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -387,7 +412,7 @@ def _restore_checkpoint(
     loss_function: nn.Module,
     optimizer: SGD,
     scheduler: CosineAnnealingLR,
-    scaler: torch.amp.GradScaler,
+    scaler: GradScaler,
     fine_tuning: FineTuningMode,
 ) -> int:
     if not path.is_file():
