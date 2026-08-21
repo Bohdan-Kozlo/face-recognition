@@ -92,16 +92,6 @@ def build_face_transform(*, training: bool) -> FaceTransform:
         v2.CenterCrop((178, 178)),
         v2.Resize((FACE_IMAGE_SIZE, FACE_IMAGE_SIZE), antialias=True),
     ]
-    if training:
-        transforms.extend(
-            [
-                v2.RandomHorizontalFlip(p=0.5),
-                v2.RandomApply(
-                    [v2.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1)],
-                    p=0.5,
-                ),
-            ]
-        )
     transforms.extend(
         [
             v2.ToDtype(torch.float32, scale=True),

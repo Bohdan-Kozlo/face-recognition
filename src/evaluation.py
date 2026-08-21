@@ -48,7 +48,7 @@ def evaluate_checkpoint(
         validate_checkpoint_metadata(checkpoint)
     except ValueError as error:
         raise ValueError(f"Cannot evaluate checkpoint: {error}") from error
-    model = FaceEmbedder(weights=None).to(device)
+    model = FaceEmbedder(initialization="scratch").to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 

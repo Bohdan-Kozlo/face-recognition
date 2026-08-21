@@ -6,23 +6,23 @@ from typing import Any, Literal
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torchvision.models import ResNet50_Weights, resnet50
+from torchvision.models import ResNet18_Weights, resnet18
 
 from config import FACE_IMAGE_SIZE, IMAGENET_MEAN, IMAGENET_STD
 
 EMBEDDING_DIM = 512
-BACKBONE_NAME = "resnet50_imagenet1k_v2"
-CHECKPOINT_FORMAT_VERSION = 1
+BACKBONE_NAME = "resnet18_imagenet1k_v1"
+CHECKPOINT_FORMAT_VERSION = 2
 
 FineTuningMode = Literal["last-layer", "all"]
+WeightInitialization = Literal["imagenet", "scratch"]
 
 
 class FaceEmbedder(nn.Module):
-    def __init__(
-        self, *, weights: ResNet50_Weights | None = ResNet50_Weights.IMAGENET1K_V2
-    ) -> None:
+    def __init__(self, *, initialization: WeightInitialization = "imagenet") -> None:
         super().__init__()
-        backbone = resnet50(weights=weights)
+        weights = ResNet18_Weights.IMAGENET1K_V1 if initialization == "imagenet" else None
+        backbone = resnet18(weights=weights)
         input_features = backbone.fc.in_features
         backbone.fc = nn.Linear(input_features, EMBEDDING_DIM, bias=False)
         self.backbone = backbone
@@ -77,7 +77,11 @@ class FaceEmbedder(nn.Module):
         return F.normalize(embeddings, dim=1)
 
 
-def checkpoint_metadata(*, fine_tuning: FineTuningMode) -> dict[str, str | int]:
+def checkpoint_metadata(
+    *,
+    fine_tuning: FineTuningMode,
+    initialization: WeightInitialization,
+) -> dict[str, str | int]:
     return {
         "format_version": CHECKPOINT_FORMAT_VERSION,
         "backbone": BACKBONE_NAME,
@@ -85,15 +89,18 @@ def checkpoint_metadata(*, fine_tuning: FineTuningMode) -> dict[str, str | int]:
         "face_image_size": FACE_IMAGE_SIZE,
         "normalization": f"imagenet:{IMAGENET_MEAN}:{IMAGENET_STD}",
         "fine_tuning": fine_tuning,
+        "initialization": initialization,
     }
 
 
-def validate_checkpoint_metadata(checkpoint: Mapping[str, Any]) -> FineTuningMode:
+def validate_checkpoint_metadata(
+    checkpoint: Mapping[str, Any],
+) -> tuple[FineTuningMode, WeightInitialization]:
     metadata = checkpoint.get("metadata")
     if not isinstance(metadata, Mapping):
-        raise ValueError("Checkpoint has no ResNet50 metadata and cannot be loaded")
+        raise ValueError("Checkpoint has no ResNet18 metadata and cannot be loaded")
 
-    expected = checkpoint_metadata(fine_tuning="last-layer")
+    expected = checkpoint_metadata(fine_tuning="last-layer", initialization="imagenet")
     for field in (
         "format_version",
         "backbone",
@@ -107,4 +114,7 @@ def validate_checkpoint_metadata(checkpoint: Mapping[str, Any]) -> FineTuningMod
     fine_tuning = metadata.get("fine_tuning")
     if fine_tuning not in {"last-layer", "all"}:
         raise ValueError("Checkpoint has an unknown fine-tuning mode")
-    return fine_tuning
+    initialization = metadata.get("initialization")
+    if initialization not in {"imagenet", "scratch"}:
+        raise ValueError("Checkpoint has an unknown weight initialization")
+    return fine_tuning, initialization

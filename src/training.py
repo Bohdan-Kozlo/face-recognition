@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from pytorch_metric_learning.losses import ArcFaceLoss
 from torch import nn
-from torch.optim import SGD, Optimizer
+from torch.optim import Adam, Optimizer
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -32,6 +32,7 @@ from model import (
     EMBEDDING_DIM,
     FaceEmbedder,
     FineTuningMode,
+    WeightInitialization,
     checkpoint_metadata,
     validate_checkpoint_metadata,
 )
@@ -39,8 +40,12 @@ from model import (
 DEFAULT_TRACKING_URI = f"sqlite:///{MLFLOW_DATABASE_PATH.resolve().as_posix()}"
 ARCFACE_MARGIN_DEGREES = 28.6
 ARCFACE_SCALE = 64
-MOMENTUM = 0.9
-WEIGHT_DECAY = 5e-4
+ADAM_BETAS = (0.9, 0.999)
+ADAM_EPS = 1e-8
+WEIGHT_DECAY = 0.0
+PRETRAINED_BACKBONE_LEARNING_RATE = 1e-5
+PRETRAINED_HEAD_LEARNING_RATE = 1e-3
+SCRATCH_LEARNING_RATE = 1e-3
 
 type GradScaler = Any
 
@@ -56,11 +61,12 @@ class TrainingConfig:
     dataset_root: Path = CELEBA_RAW_DIR
     run_name: str | None = None
     batch_size: int = 32
-    backbone_learning_rate: float = 1e-5
-    embedding_learning_rate: float = 1e-3
-    arcface_learning_rate: float = 1e-3
+    backbone_learning_rate: float | None = None
+    embedding_learning_rate: float | None = None
+    arcface_learning_rate: float | None = None
     epochs: int = 12
     fine_tuning: FineTuningMode = "last-layer"
+    initialization: WeightInitialization = "imagenet"
     seed: int = 24
     deterministic: bool = False
     num_workers: int = 2
@@ -92,20 +98,22 @@ def _create_optimizer(
     model: FaceEmbedder,
     loss_function: nn.Module,
     config: TrainingConfig,
-) -> SGD:
-    return SGD(
+) -> Adam:
+    backbone_learning_rate, embedding_learning_rate, arcface_learning_rate = _learning_rates(config)
+    return Adam(
         model.optimizer_parameter_groups(
-            backbone_learning_rate=config.backbone_learning_rate,
-            embedding_learning_rate=config.embedding_learning_rate,
+            backbone_learning_rate=backbone_learning_rate,
+            embedding_learning_rate=embedding_learning_rate,
         )
         + [
             {
                 "name": "arcface",
                 "params": loss_function.parameters(),
-                "lr": config.arcface_learning_rate,
+                "lr": arcface_learning_rate,
             },
         ],
-        momentum=MOMENTUM,
+        betas=ADAM_BETAS,
+        eps=ADAM_EPS,
         weight_decay=WEIGHT_DECAY,
     )
 
@@ -122,13 +130,28 @@ def _create_grad_scaler(device: torch.device) -> GradScaler:
     return torch_amp.GradScaler(device.type, init_scale=128, enabled=device.type == "cuda")
 
 
+def _learning_rates(config: TrainingConfig) -> tuple[float, float, float]:
+    defaults = (
+        (PRETRAINED_BACKBONE_LEARNING_RATE,) + (PRETRAINED_HEAD_LEARNING_RATE,) * 2
+        if config.initialization == "imagenet"
+        else (SCRATCH_LEARNING_RATE,) * 3
+    )
+    return (
+        config.backbone_learning_rate if config.backbone_learning_rate is not None else defaults[0],
+        config.embedding_learning_rate
+        if config.embedding_learning_rate is not None
+        else defaults[1],
+        config.arcface_learning_rate if config.arcface_learning_rate is not None else defaults[2],
+    )
+
+
 def train(config: TrainingConfig) -> TrainingResult:
     _validate_config(config)
     device = _resolve_device(config.device)
     _seed_everything(config.seed, deterministic=config.deterministic)
     loaders = _create_data_loaders(config, device)
 
-    model = FaceEmbedder().to(device)
+    model = FaceEmbedder(initialization=config.initialization).to(device)
     model.set_fine_tuning_mode(config.fine_tuning)
     loss_function = ArcFaceLoss(
         num_classes=loaders.number_of_classes,
@@ -151,6 +174,7 @@ def train(config: TrainingConfig) -> TrainingResult:
             scheduler,
             scaler,
             config.fine_tuning,
+            config.initialization,
         )
     if start_epoch >= config.epochs:
         raise TrainingError(
@@ -158,7 +182,7 @@ def train(config: TrainingConfig) -> TrainingResult:
         )
 
     experiment_id = _configure_mlflow()
-    checkpoint_path = CHECKPOINTS_DIR / f"resnet50-{config.fine_tuning}.pt"
+    checkpoint_path = CHECKPOINTS_DIR / f"resnet18-{config.initialization}-{config.fine_tuning}.pt"
     completed_epochs = start_epoch
 
     with mlflow.start_run(experiment_id=experiment_id, run_name=config.run_name) as active_run:
@@ -206,6 +230,7 @@ def train(config: TrainingConfig) -> TrainingResult:
                     scheduler,
                     scaler,
                     config.fine_tuning,
+                    config.initialization,
                 )
         except KeyboardInterrupt:
             _save_checkpoint(
@@ -217,6 +242,7 @@ def train(config: TrainingConfig) -> TrainingResult:
                 scheduler,
                 scaler,
                 config.fine_tuning,
+                config.initialization,
             )
             mlflow.log_artifact(str(checkpoint_path), artifact_path="checkpoints")
             raise
@@ -270,7 +296,7 @@ def _train_epoch(
     model: FaceEmbedder,
     loss_function: nn.Module,
     loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
-    optimizer: SGD,
+    optimizer: Optimizer,
     scaler: GradScaler,
     device: torch.device,
     batch_limit: int | None,
@@ -385,10 +411,11 @@ def _save_checkpoint(
     completed_epochs: int,
     model: FaceEmbedder,
     loss_function: nn.Module,
-    optimizer: SGD,
+    optimizer: Optimizer,
     scheduler: CosineAnnealingLR,
     scaler: GradScaler,
     fine_tuning: FineTuningMode,
+    initialization: WeightInitialization,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -399,7 +426,10 @@ def _save_checkpoint(
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "grad_scaler_state_dict": scaler.state_dict(),
-            "metadata": checkpoint_metadata(fine_tuning=fine_tuning),
+            "metadata": checkpoint_metadata(
+                fine_tuning=fine_tuning,
+                initialization=initialization,
+            ),
         },
         path,
     )
@@ -410,23 +440,29 @@ def _restore_checkpoint(
     device: torch.device,
     model: FaceEmbedder,
     loss_function: nn.Module,
-    optimizer: SGD,
+    optimizer: Optimizer,
     scheduler: CosineAnnealingLR,
     scaler: GradScaler,
     fine_tuning: FineTuningMode,
+    initialization: WeightInitialization,
 ) -> int:
     if not path.is_file():
         raise TrainingError(f"Resume checkpoint does not exist: {path}")
 
     checkpoint = torch.load(path, map_location=device, weights_only=True)
     try:
-        saved_fine_tuning = validate_checkpoint_metadata(checkpoint)
+        saved_fine_tuning, saved_initialization = validate_checkpoint_metadata(checkpoint)
     except ValueError as error:
         raise TrainingError(f"Cannot resume checkpoint: {error}") from error
     if saved_fine_tuning != fine_tuning:
         raise TrainingError(
             "Checkpoint fine-tuning mode does not match the current run: "
             f"{saved_fine_tuning!r} != {fine_tuning!r}"
+        )
+    if saved_initialization != initialization:
+        raise TrainingError(
+            "Checkpoint initialization does not match the current run: "
+            f"{saved_initialization!r} != {initialization!r}"
         )
     model.load_state_dict(checkpoint["model_state_dict"])
     loss_function.load_state_dict(checkpoint["arcface_loss_state_dict"])
@@ -463,9 +499,13 @@ def _log_run_inputs(
             "backbone": BACKBONE_NAME,
             "embedding_dim": EMBEDDING_DIM,
             "fine_tuning": config.fine_tuning,
+            "initialization": config.initialization,
             "arcface_margin_degrees": ARCFACE_MARGIN_DEGREES,
             "arcface_scale": ARCFACE_SCALE,
-            "momentum": MOMENTUM,
+            "optimizer": "Adam",
+            "adam_beta1": ADAM_BETAS[0],
+            "adam_beta2": ADAM_BETAS[1],
+            "adam_eps": ADAM_EPS,
             "weight_decay": WEIGHT_DECAY,
             "number_of_classes": loaders.number_of_classes,
             "train_images": loaders.train_images,
@@ -479,13 +519,21 @@ def _log_run_inputs(
 
 
 def _validate_config(config: TrainingConfig) -> None:
-    positive_values = {
-        "batch_size": config.batch_size,
-        "backbone_learning_rate": config.backbone_learning_rate,
-        "embedding_learning_rate": config.embedding_learning_rate,
-        "arcface_learning_rate": config.arcface_learning_rate,
-        "epochs": config.epochs,
+    positive_values: dict[str, float] = {
+        "batch_size": float(config.batch_size),
+        "epochs": float(config.epochs),
     }
+    positive_values.update(
+        {
+            name: value
+            for name, value in {
+                "backbone_learning_rate": config.backbone_learning_rate,
+                "embedding_learning_rate": config.embedding_learning_rate,
+                "arcface_learning_rate": config.arcface_learning_rate,
+            }.items()
+            if value is not None
+        }
+    )
     invalid = [name for name, value in positive_values.items() if value <= 0]
     if invalid:
         raise TrainingError(f"Configuration values must be positive: {', '.join(invalid)}")
@@ -497,6 +545,10 @@ def _validate_config(config: TrainingConfig) -> None:
         raise TrainingError("validation_batch_limit must be positive")
     if config.fine_tuning not in {"last-layer", "all"}:
         raise TrainingError("fine_tuning must be last-layer or all")
+    if config.initialization not in {"imagenet", "scratch"}:
+        raise TrainingError("initialization must be imagenet or scratch")
+    if config.initialization == "scratch" and config.fine_tuning != "all":
+        raise TrainingError("scratch initialization requires fine_tuning=all")
 
 
 def _resolve_device(requested: str) -> torch.device:
@@ -533,7 +585,7 @@ def _seed_worker(worker_id: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Fine-tune pretrained ResNet50 on CelebA.",
+        description="Fine-tune pretrained ResNet18 on CelebA.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--epochs", type=int, default=12)
@@ -541,12 +593,16 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--fine-tuning", choices=("last-layer", "all"), required=True)
-    parser.add_argument("--run-name", default="resnet50-local")
+    parser.add_argument("--initialization", choices=("imagenet", "scratch"), default="imagenet")
+    parser.add_argument("--run-name", default="resnet18-local")
     parser.add_argument("--resume-from", type=Path)
     parser.add_argument("--identity-limit", type=int)
     parser.add_argument("--batch-limit", type=int)
     parser.add_argument("--validation-batch-limit", type=int)
     parser.add_argument("--deterministic", action="store_true")
+    parser.add_argument("--backbone-learning-rate", type=float)
+    parser.add_argument("--embedding-learning-rate", type=float)
+    parser.add_argument("--arcface-learning-rate", type=float)
     args = parser.parse_args()
 
     result = train(
@@ -558,10 +614,14 @@ def main() -> None:
             device=args.device,
             resume_from=args.resume_from,
             fine_tuning=args.fine_tuning,
+            initialization=args.initialization,
             identity_limit=args.identity_limit,
             batch_limit=args.batch_limit,
             validation_batch_limit=args.validation_batch_limit,
             deterministic=args.deterministic,
+            backbone_learning_rate=args.backbone_learning_rate,
+            embedding_learning_rate=args.embedding_learning_rate,
+            arcface_learning_rate=args.arcface_learning_rate,
         )
     )
     print(f"Completed epochs: {result.completed_epochs}")
