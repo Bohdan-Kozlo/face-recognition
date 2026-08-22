@@ -4,9 +4,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import torch
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    det_curve,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -22,8 +32,6 @@ class EvaluationConfig:
     dataset_root: Path = CELEBA_RAW_DIR
     batch_size: int = 32
     num_workers: int = 2
-    identity_limit: int | None = None
-    batch_limit: int | None = None
     device: str = "auto"
 
 
@@ -48,15 +56,13 @@ def evaluate_checkpoint(
         validate_checkpoint_metadata(checkpoint)
     except ValueError as error:
         raise ValueError(f"Cannot evaluate checkpoint: {error}") from error
-    model = FaceEmbedder(initialization="scratch").to(device)
+    model = FaceEmbedder(load_pretrained_weights=False).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
     dataset = CelebAFaceDataset(
         config.manifest_path,
         config.dataset_root,
-        training=False,
-        identity_limit=config.identity_limit,
     )
     loader = DataLoader(
         dataset,
@@ -65,12 +71,20 @@ def evaluate_checkpoint(
         num_workers=config.num_workers,
         pin_memory=device.type == "cuda",
     )
-    genuine_scores, impostor_scores = _collect_pair_scores(
-        model,
-        loader,
-        device,
-        config.batch_limit,
-    )
+    return evaluate_model(model, loader, device, threshold=threshold)
+
+
+def evaluate_model(
+    model: FaceEmbedder,
+    loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
+    device: torch.device,
+    *,
+    threshold: float | None = None,
+) -> VerificationEvaluation:
+    """Evaluate one genuine and one impostor pair per identity."""
+
+    model.eval()
+    genuine_scores, impostor_scores = _collect_pair_scores(model, loader, device)
     selected_threshold = (
         _select_threshold(genuine_scores, impostor_scores) if threshold is None else threshold
     )
@@ -87,18 +101,14 @@ def _collect_pair_scores(
     model: FaceEmbedder,
     loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
     device: torch.device,
-    batch_limit: int | None,
 ) -> tuple[np.ndarray, np.ndarray]:
     embeddings_by_identity: dict[int, list[torch.Tensor]] = {}
-    total = min(len(loader), batch_limit) if batch_limit is not None else len(loader)
 
     with torch.inference_mode():
-        for batch_index, (images, labels) in enumerate(
-            tqdm(loader, total=total, desc="Evaluation")
-        ):
-            if batch_limit is not None and batch_index >= batch_limit:
-                break
+        for images, labels in tqdm(loader, desc="Evaluation"):
             embeddings = model(images.to(device, non_blocking=True)).float().cpu()
+            if not torch.isfinite(embeddings).all():
+                raise ValueError("Evaluation embeddings are not finite")
             for embedding, label in zip(embeddings, labels.tolist(), strict=True):
                 embeddings_by_identity.setdefault(label, []).append(embedding)
 
@@ -128,31 +138,9 @@ def _collect_pair_scores(
     return genuine_scores, impostor_scores
 
 
-def _candidate_thresholds(genuine: np.ndarray, impostor: np.ndarray) -> np.ndarray:
-    scores = np.unique(np.concatenate([genuine, impostor]))
-    if len(scores) == 1:
-        return scores
-    midpoints = (scores[:-1] + scores[1:]) / 2
-    return np.concatenate([[scores[0] - 1e-6], midpoints, [scores[-1] + 1e-6]])
-
-
-def _error_rates(
-    genuine: np.ndarray,
-    impostor: np.ndarray,
-    thresholds: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    false_acceptance_rates = (impostor[:, None] >= thresholds).mean(axis=0)
-    false_rejection_rates = (genuine[:, None] < thresholds).mean(axis=0)
-    return false_acceptance_rates, false_rejection_rates
-
-
 def _select_threshold(genuine: np.ndarray, impostor: np.ndarray) -> float:
-    thresholds = _candidate_thresholds(genuine, impostor)
-    false_acceptance_rates, false_rejection_rates = _error_rates(
-        genuine,
-        impostor,
-        thresholds,
-    )
+    labels, scores = _verification_labels_and_scores(genuine, impostor)
+    false_acceptance_rates, false_rejection_rates, thresholds = det_curve(labels, scores)
     best_index = int(np.argmin(false_acceptance_rates + false_rejection_rates))
     return float(thresholds[best_index])
 
@@ -162,40 +150,39 @@ def _calculate_metrics(
     impostor: np.ndarray,
     threshold: float,
 ) -> dict[str, float]:
-    true_positives = int((genuine >= threshold).sum())
-    false_negatives = len(genuine) - true_positives
-    false_positives = int((impostor >= threshold).sum())
-    true_negatives = len(impostor) - false_positives
-
-    total = len(genuine) + len(impostor)
-    precision = true_positives / max(true_positives + false_positives, 1)
-    recall = true_positives / len(genuine)
-    false_acceptance_rate = false_positives / len(impostor)
-    false_rejection_rate = false_negatives / len(genuine)
-
-    thresholds = _candidate_thresholds(genuine, impostor)
-    far_curve, frr_curve = _error_rates(genuine, impostor, thresholds)
+    labels, scores = _verification_labels_and_scores(genuine, impostor)
+    predictions = scores >= threshold
+    normalized_confusion = confusion_matrix(labels, predictions, labels=[0, 1], normalize="true")
+    false_acceptance_rate = float(normalized_confusion[0, 1])
+    false_rejection_rate = float(normalized_confusion[1, 0])
+    far_curve, frr_curve, _ = det_curve(labels, scores)
     eer_index = int(np.argmin(np.abs(far_curve - frr_curve)))
-    eer = float((far_curve[eer_index] + frr_curve[eer_index]) / 2)
-    auc = float(
-        (genuine[:, None] > impostor[None, :]).mean()
-        + 0.5 * (genuine[:, None] == impostor[None, :]).mean()
-    )
 
     return {
         "threshold": threshold,
-        "accuracy": (true_positives + true_negatives) / total,
-        "precision": precision,
-        "recall_tar": recall,
-        "f1": 2 * precision * recall / max(precision + recall, 1e-12),
+        "accuracy": float(accuracy_score(labels, predictions)),
+        "precision": float(precision_score(labels, predictions, zero_division=cast(Any, 0))),
+        "recall_tar": float(recall_score(labels, predictions, zero_division=cast(Any, 0))),
+        "f1": float(f1_score(labels, predictions, zero_division=cast(Any, 0))),
         "far": false_acceptance_rate,
         "frr": false_rejection_rate,
-        "roc_auc": auc,
-        "eer": eer,
+        "roc_auc": float(roc_auc_score(labels, scores)),
+        "eer": float((far_curve[eer_index] + frr_curve[eer_index]) / 2),
         "genuine_similarity_mean": float(genuine.mean()),
         "impostor_similarity_mean": float(impostor.mean()),
+        "similarity_gap": float(genuine.mean() - impostor.mean()),
         "evaluated_identities": float(len(genuine)),
     }
+
+
+def _verification_labels_and_scores(
+    genuine: np.ndarray,
+    impostor: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    labels = np.concatenate(
+        [np.ones(len(genuine), dtype=np.int8), np.zeros(len(impostor), dtype=np.int8)]
+    )
+    return labels, np.concatenate([genuine, impostor])
 
 
 def _resolve_device(requested: str) -> torch.device:

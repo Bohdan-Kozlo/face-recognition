@@ -20,11 +20,13 @@ notebook = [
     "ipykernel>=7.3.0",
     "jupyterlab>=4.6.3",
     "matplotlib>=3.11.1",
+    "onnxruntime>=1.23,<2",
     "pandas>=2.3.3",
 ]
 training = [
     "mlflow>=3.15.1",
     "pytorch-metric-learning>=2.9.0",
+    "scikit-learn>=1.7,<2",
     "tqdm>=4.70.0",
 ]
 

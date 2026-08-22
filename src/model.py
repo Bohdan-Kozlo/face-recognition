@@ -12,16 +12,15 @@ from config import FACE_IMAGE_SIZE, IMAGENET_MEAN, IMAGENET_STD
 
 EMBEDDING_DIM = 512
 BACKBONE_NAME = "resnet18_imagenet1k_v1"
-CHECKPOINT_FORMAT_VERSION = 2
+CHECKPOINT_FORMAT_VERSION = 3
 
 FineTuningMode = Literal["last-layer", "all"]
-WeightInitialization = Literal["imagenet", "scratch"]
 
 
 class FaceEmbedder(nn.Module):
-    def __init__(self, *, initialization: WeightInitialization = "imagenet") -> None:
+    def __init__(self, *, load_pretrained_weights: bool = True) -> None:
         super().__init__()
-        weights = ResNet18_Weights.IMAGENET1K_V1 if initialization == "imagenet" else None
+        weights = ResNet18_Weights.IMAGENET1K_V1 if load_pretrained_weights else None
         backbone = resnet18(weights=weights)
         input_features = backbone.fc.in_features
         backbone.fc = nn.Linear(input_features, EMBEDDING_DIM, bias=False)
@@ -80,7 +79,6 @@ class FaceEmbedder(nn.Module):
 def checkpoint_metadata(
     *,
     fine_tuning: FineTuningMode,
-    initialization: WeightInitialization,
 ) -> dict[str, str | int]:
     return {
         "format_version": CHECKPOINT_FORMAT_VERSION,
@@ -89,18 +87,17 @@ def checkpoint_metadata(
         "face_image_size": FACE_IMAGE_SIZE,
         "normalization": f"imagenet:{IMAGENET_MEAN}:{IMAGENET_STD}",
         "fine_tuning": fine_tuning,
-        "initialization": initialization,
     }
 
 
 def validate_checkpoint_metadata(
     checkpoint: Mapping[str, Any],
-) -> tuple[FineTuningMode, WeightInitialization]:
+) -> FineTuningMode:
     metadata = checkpoint.get("metadata")
     if not isinstance(metadata, Mapping):
         raise ValueError("Checkpoint has no ResNet18 metadata and cannot be loaded")
 
-    expected = checkpoint_metadata(fine_tuning="last-layer", initialization="imagenet")
+    expected = checkpoint_metadata(fine_tuning="last-layer")
     for field in (
         "format_version",
         "backbone",
@@ -114,7 +111,4 @@ def validate_checkpoint_metadata(
     fine_tuning = metadata.get("fine_tuning")
     if fine_tuning not in {"last-layer", "all"}:
         raise ValueError("Checkpoint has an unknown fine-tuning mode")
-    initialization = metadata.get("initialization")
-    if initialization not in {"imagenet", "scratch"}:
-        raise ValueError("Checkpoint has an unknown weight initialization")
-    return fine_tuning, initialization
+    return fine_tuning

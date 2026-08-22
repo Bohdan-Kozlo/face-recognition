@@ -45,7 +45,6 @@ class PreparationConfig:
     output_dir: Path = CELEBA_MANIFESTS_DIR
     seed: int = 24
     min_images: int = 3
-    limit_identities: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,16 +59,11 @@ class CelebAFaceDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         self,
         manifest_path: Path,
         dataset_root: Path = CELEBA_RAW_DIR,
-        *,
-        training: bool,
-        identity_limit: int | None = None,
-        seed: int = 24,
     ) -> None:
         records = _load_manifest_records(manifest_path)
-        selected_records = _select_and_remap_records(records, identity_limit, seed)
-        self.identity_ids = frozenset(record.identity_id for record in selected_records)
-        self._records = _resolve_image_paths(selected_records, dataset_root)
-        self._transform = build_face_transform(training=training)
+        self.identity_ids = frozenset(record.identity_id for record in records)
+        self._records = _resolve_image_paths(records, dataset_root)
+        self._transform = build_face_transform()
         self.number_of_classes = len(self.identity_ids)
 
     def __len__(self) -> int:
@@ -86,7 +80,7 @@ class CelebAFaceDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         return tensor, torch.tensor(record.class_index, dtype=torch.long)
 
 
-def build_face_transform(*, training: bool) -> FaceTransform:
+def build_face_transform() -> FaceTransform:
     transforms: list[Callable[..., Any]] = [
         v2.ToImage(),
         v2.CenterCrop((178, 178)),
@@ -144,43 +138,6 @@ def _resolve_image_paths(records: list[ManifestRecord], dataset_root: Path) -> l
     return resolved
 
 
-def _select_and_remap_records(
-    records: list[ManifestRecord],
-    identity_limit: int | None,
-    seed: int,
-) -> list[ManifestRecord]:
-    records_by_identity: defaultdict[int, list[ManifestRecord]] = defaultdict(list)
-    for record in records:
-        records_by_identity[record.identity_id].append(record)
-
-    identity_ids = sorted(records_by_identity)
-    if identity_limit is not None:
-        if identity_limit < 2:
-            raise DataPreparationError("Identity limit must be at least 2")
-        random.Random(seed).shuffle(identity_ids)
-        identity_ids = sorted(identity_ids[:identity_limit])
-
-    class_indices = {
-        identity_id: class_index for class_index, identity_id in enumerate(identity_ids)
-    }
-    remapped_by_identity = {
-        identity_id: [
-            ManifestRecord(record.image_path, identity_id, class_indices[identity_id])
-            for record in records_by_identity[identity_id]
-        ]
-        for identity_id in identity_ids
-    }
-
-    interleaved: list[ManifestRecord] = []
-    largest_identity = max(len(items) for items in remapped_by_identity.values())
-    for image_index in range(largest_identity):
-        for identity_id in identity_ids:
-            identity_records = remapped_by_identity[identity_id]
-            if image_index < len(identity_records):
-                interleaved.append(identity_records[image_index])
-    return interleaved
-
-
 def prepare_celeba(config: PreparationConfig) -> dict[str, Any]:
     annotation_path = config.dataset_root / IDENTITY_ANNOTATION_FILENAME
     image_dir = config.dataset_root / IMAGE_DIRECTORY_NAME
@@ -192,7 +149,7 @@ def prepare_celeba(config: PreparationConfig) -> dict[str, Any]:
         for identity_id, filenames in identities.items()
         if len(filenames) >= config.min_images
     )
-    selected_ids = _select_identities(eligible_ids, config)
+    selected_ids = _select_identities(eligible_ids, config.seed)
     splits = _split_identities(selected_ids)
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
@@ -202,7 +159,6 @@ def prepare_celeba(config: PreparationConfig) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "seed": config.seed,
         "minimum_images_per_identity": config.min_images,
-        "identity_limit": config.limit_identities,
         "total_images": sum(len(filenames) for filenames in identities.values()),
         "total_identities": len(identities),
         "eligible_identities": len(eligible_ids),
@@ -250,13 +206,10 @@ def _load_identities(annotation_path: Path) -> IdentityImages:
 
 def _select_identities(
     eligible_ids: list[int],
-    config: PreparationConfig,
+    seed: int,
 ) -> list[int]:
     selected_ids = eligible_ids.copy()
-    random.Random(config.seed).shuffle(selected_ids)
-
-    if config.limit_identities is not None:
-        selected_ids = selected_ids[: config.limit_identities]
+    random.Random(seed).shuffle(selected_ids)
     if len(selected_ids) < 10:
         raise DataPreparationError(
             "At least 10 eligible identities are required for non-empty 80/10/10 splits"

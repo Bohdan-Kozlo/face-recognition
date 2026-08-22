@@ -1,19 +1,28 @@
-# Face Recognition Authentication
+# Face Recognition
 
-An prototype for one-to-one face verification. Users will enroll with three
-face images and later authenticate with an email address and a new face image.
+An prototype for one-to-one face verification.
 
 ## Fine-tuning ResNet18
 
 The project uses ImageNet-pretrained ResNet18 with a 512-dimensional ArcFace embedding.
 Choose the training scope explicitly:
 
-```powershell
-uv run --group training python src/training.py --fine-tuning last-layer --deterministic
+```
+uv run --group training python src/training.py --fine-tuning last-layer
 ```
 
-Use `--fine-tuning all` to update the full backbone. To train without ImageNet
-weights, use `--initialization scratch --fine-tuning all`; it defaults to a
-learning rate of `0.001`. Training uses the standard `Adam` optimizer for both
-ImageNet fine-tuning and training from scratch. Checkpoints include both
-choices in their names, for example `checkpoints/resnet18-scratch-all.pt`.
+Use `--fine-tuning all` to update the full backbone. Both modes train the new
+embedding layer and ArcFace weights. Training metrics and the final checkpoint
+are saved to local MLflow.
+
+Resume an interrupted run with its checkpoint:
+
+```
+uv run --group training python src/training.py --fine-tuning last-layer --resume-from checkpoints/resnet18-last-layer.pt
+```
+
+Inspect all available options with:
+
+```
+uv run --group training python src/training.py --help
+```
